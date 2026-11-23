@@ -1,0 +1,5 @@
+*.bundle
+*.bundle.sha256
+*.bundle.manifest
+*.token
+.airgap-sync/

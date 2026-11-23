@@ -1,0 +1,25 @@
+# Always-on GitLab Runner for airgap-sync on the bridge machine (shell executor inside a container).
+# Use this when the bridge machine reaches both GitLab instances at once and runs Docker.
+#
+#   1. Copy this folder to ~/.airgap-sync/runner/ and edit airgap-sync.conf next to it (see ../airgap-sync.example.conf).
+#      Leave SOURCE_URL empty there: the CI job reads its own repository with the job token.
+#      Point TARGET_TOKEN_FILE at /airgap/<file>; put the token file in ~/.airgap-sync/ on the host.
+#   2. docker compose -f ~/.airgap-sync/runner/docker-compose.yml up -d
+#   3. Create a project runner in the SOURCE GitLab (tag: airgap, untagged jobs off) and register it:
+#        docker exec airgap-runner gitlab-runner register --non-interactive \
+#          --url https://<source-gitlab> --token glrt-... --executor shell --name airgap-bridge
+#   4. Make sure Docker starts at login/boot, so the runner comes back after a restart.
+name: airgap-runner
+services:
+  runner:
+    image: gitlab/gitlab-runner:alpine-v19.5.3
+    container_name: airgap-runner
+    restart: unless-stopped
+    environment:
+      AIRGAP_CONFIG: /airgap/runner/airgap-sync.conf
+    volumes:
+      - runner-config:/etc/gitlab-runner
+      - ../:/airgap                         # ~/.airgap-sync: config, token file, work dir
+      - ../../airgap-files:/pkgs:ro          # files referenced by lock files (PACKAGE_DIRS=/pkgs)
+volumes:
+  runner-config:

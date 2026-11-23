@@ -1,0 +1,52 @@
+# airgap-sync CI jobs — paste into the SOURCE (development-network) project's .gitlab-ci.yml.
+# Assumes the tool is vendored at tools/airgap-sync/ in that repository (adjust the paths if not).
+#
+# The jobs exist only where the project CI/CD variable AIRGAP_SYNC is set:
+#   AIRGAP_SYNC=bash        → airgap:sync          (Linux/macOS runner, or Docker runner from runner/)
+#   AIRGAP_SYNC=powershell  → airgap:sync:windows  (Windows runner with the powershell shell)
+# If the same .gitlab-ci.yml also runs on the TARGET GitLab, leave the variable unset there and nothing runs.
+#
+# The target URL and token live only on the runner machine (~/.airgap-sync/airgap-sync.conf + token file),
+# never in this repository or in CI/CD variables of the source GitLab.
+#
+# Pushing main to the target often starts a production deployment, so the job is manual (▶) by default.
+#   AIRGAP_SYNC_AUTO=1   run automatically on every push to main / release/*
+#   AIRGAP_SCHEDULE=1    set on a pipeline schedule to sync every matching branch on that schedule
+# Variables for a manual run: AIRGAP_DRY_RUN=1 · AIRGAP_FORCE=1 · AIRGAP_WITH_PACKAGES=1
+.airgap:sync:
+  stage: deploy
+  needs: []
+  resource_group: airgap-sync
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths: [airgap-sync-report.tsv]
+
+.airgap:rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $AIRGAP_SCHEDULE == "1"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+    - if: ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^release\//) && $CI_PIPELINE_SOURCE == "push" && $AIRGAP_SYNC_AUTO == "1"
+    - if: ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^release\//) && $CI_PIPELINE_SOURCE == "push"
+      when: manual
+
+airgap:sync:
+  extends: .airgap:sync
+  tags: [airgap]
+  rules:
+    - if: $AIRGAP_SYNC != "bash"
+      when: never
+    - !reference [.airgap:rules, rules]
+  script:
+    - bash tools/airgap-sync/airgap-sync.sh ci
+
+airgap:sync:windows:
+  extends: .airgap:sync
+  tags: [airgap]
+  rules:
+    - if: $AIRGAP_SYNC != "powershell"
+      when: never
+    - !reference [.airgap:rules, rules]
+  script:
+    - '& .\tools\airgap-sync\airgap-sync.ps1 ci'

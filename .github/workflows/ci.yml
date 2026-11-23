@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax
+        run: bash -n airgap-sync.sh && bash -n test/e2e-local-gitlab.sh
+      - name: shellcheck (errors only)
+        run: shellcheck -S error airgap-sync.sh test/e2e-local-gitlab.sh
+      - name: help runs
+        run: bash airgap-sync.sh help >/dev/null
+      - name: PowerShell parses
+        shell: pwsh
+        run: |
+          $null = [System.Management.Automation.Language.Parser]::ParseFile("$PWD/airgap-sync.ps1", [ref]$null, [ref]$errs)
+          if ($errs) { $errs; exit 1 }
