@@ -60,6 +60,9 @@ packages
       --lock FILE        저장소 대신 이 lock 파일을 쓴다 (여러 번 가능)
       --ref BRANCH       lock 을 읽을 브랜치 (기본 PACKAGE_REF)
 
+운영망 연결 재시도  TARGET_RETRIES(기본 3)·TARGET_RETRY_DELAY(기본 5초, 매번 두 배) — 연결 실패류만
+                   (환경 변수 AIRGAP_TARGET_RETRIES·AIRGAP_TARGET_RETRY_DELAY 로도 덮는다. 0 이면 재시도 안 함)
+
 종료 코드  0 성공 · 1 사용법/설정 · 2 실패 · 3 fast-forward 아님(멈춤) · 4 bundle 거부 · 5 패키지 불일치
 EOF
 }
@@ -77,7 +80,7 @@ expand_home() { case "$1" in "~"|"~/"*) printf '%s%s' "$HOME" "${1#\~}";; *) pri
 ZERO=0000000000000000000000000000000000000000
 
 # ---------- 설정 ----------
-CFG_KEYS="NAME SOURCE_URL TARGET_URL SOURCE_USER TARGET_USER BRANCHES WORK_DIR LOG_FILE SOURCE_TOKEN_FILE TARGET_TOKEN_FILE SOURCE_RESOLVE TARGET_RESOLVE PUSH_OPTIONS PUSH_ATOMIC TARGET_API_URL TARGET_PROJECT PACKAGE_LOCKS PACKAGE_REF PACKAGE_DIRS"
+CFG_KEYS="NAME SOURCE_URL TARGET_URL SOURCE_USER TARGET_USER BRANCHES WORK_DIR LOG_FILE SOURCE_TOKEN_FILE TARGET_TOKEN_FILE SOURCE_RESOLVE TARGET_RESOLVE PUSH_OPTIONS PUSH_ATOMIC TARGET_API_URL TARGET_PROJECT PACKAGE_LOCKS PACKAGE_REF PACKAGE_DIRS TARGET_RETRIES TARGET_RETRY_DELAY"
 load_config() {
   local f="$1" line k v
   [ -f "$f" ] || die $EX_USAGE "설정 파일이 없다: $f  (예시: $(dirname "${BASH_SOURCE[0]}")/airgap-sync.example.conf)"
@@ -110,6 +113,10 @@ resolve_settings() {
   PACKAGE_DIRS="$(cfg PACKAGE_DIRS)"
   TARGET_API_URL="$(cfg TARGET_API_URL)"
   TARGET_PROJECT="$(cfg TARGET_PROJECT)"
+  TARGET_RETRIES="$(cfg TARGET_RETRIES 3)"
+  [[ "$TARGET_RETRIES" =~ ^[0-9]+$ ]] || { warn "TARGET_RETRIES 는 0 이상의 정수여야 한다 ($TARGET_RETRIES) — 3 으로 한다"; TARGET_RETRIES=3; }
+  TARGET_RETRY_DELAY="$(cfg TARGET_RETRY_DELAY 5)"
+  [[ "$TARGET_RETRY_DELAY" =~ ^[0-9]+$ ]] || { warn "TARGET_RETRY_DELAY 는 0 이상의 정수(초)여야 한다 ($TARGET_RETRY_DELAY) — 5 로 한다"; TARGET_RETRY_DELAY=5; }
   if [ -z "$TARGET_API_URL" ] && [[ "$TARGET_URL" == http*://* ]]; then
     local base; base="$(clean_url "$TARGET_URL")"; base="${base#*://}"
     TARGET_API_URL="${TARGET_URL%%://*}://${base%%/*}/api/v4"
@@ -149,6 +156,48 @@ setup_git_auth() {
   return 0
 }
 G() { git --git-dir="$REPO" "$@"; }
+
+# ---------- 운영망 연결 재시도 ----------
+# 운영망 접속이 간헐적으로 TCP 연결 단계에서 끊기는 경우(curl 28/7·RPC failed 등)만 다시 시도한다.
+# 인증 실패·보호 브랜치 거부·non-fast-forward·lease 불일치 같은 "서버가 답한 거부" 는 다시 해도 같으니 바로 실패시킨다.
+NO_RETRY_RE='HTTP (400|401|403|404|405|407|409|411|413|422)|returned error: 4[0-9][0-9]|Authentication failed|Access denied|could not read (Username|Password)|terminal prompts disabled|\[rejected\]|\[remote rejected\]|stale info|non-fast-forward|fetch first|protected branch|pre-receive hook declined|^! '
+RETRY_RE="curl (6|7|28|35|52|55|56)([^0-9]|\$)|curl: \((6|7|28|35|52|55|56)\)|Could not connect|Couldn't connect|Failed to connect|Could not resolve host|Connection (timed out|refused|reset)|Operation timed out|RPC failed|unexpected disconnect|remote end hung up|early EOF|Empty reply from server|(Send|Recv) failure|HTTP (502|503|504)|returned error: (502|503|504)"
+is_transient() { # $1 = 출력 → 연결 실패류면 0
+  printf '%s\n' "$1" | grep -qiE "$NO_RETRY_RE" && return 1
+  printf '%s\n' "$1" | grep -qiE "$RETRY_RE"
+}
+# 출력에서 URL 안의 사용자·비밀번호를 지운다 (토큰은 헤더로만 넘기지만 URL 에 적었을 때 대비)
+scrub() { sed -E 's#([a-zA-Z+]+://)[^/@[:space:]]*@#\1#g'; }
+
+# retry_target <명령...> — 운영망에 닿는 명령을 실행하고, 연결 실패류면 TARGET_RETRIES 번까지 다시 한다.
+#   결과: 종료 코드 그대로 · RT_OUT(stdout) · RT_ERR(stderr) · RT_TRIES(재시도한 횟수) · RT_DONE(1 = 확인 함수가 이미 반영됐다고 함)
+#   RT_PRECHECK=<함수> 를 주면 다시 보내기 전에 그 함수로 "첫 시도가 사실은 들어갔는지" 를 본다 (0 이면 다시 보내지 않고 성공, 함수 출력이 RT_OUT).
+#   재시도 안내는 stderr 로 쓴다 — $(...) 로 결과를 받는 곳(api_curl)을 더럽히지 않게.
+RT_OUT="" RT_ERR="" RT_TRIES=0 RT_DONE="" RT_PRECHECK="" RT_IN_PRECHECK=""
+retry_target() {
+  local max="$TARGET_RETRIES" delay="$TARGET_RETRY_DELAY" i=0 rc errf pc="$RT_PRECHECK" why landed
+  [ -n "$RT_IN_PRECHECK" ] && max=0   # 확인 함수 안에서는 한 번만 (재시도 안에서 또 재시도하지 않게)
+  errf="$(mktemp "${TMPDIR:-/tmp}/airgap-rt.XXXXXX")"
+  RT_DONE=""
+  while :; do
+    rc=0; RT_OUT="$("$@" 2>"$errf")" || rc=$?
+    RT_ERR="$(cat "$errf")"
+    [ $rc -eq 0 ] && break
+    is_transient "$RT_OUT"$'\n'"$RT_ERR" || break
+    [ "$i" -lt "$max" ] || break
+    i=$((i+1))
+    why="$(printf '%s\n%s\n' "$RT_ERR" "$RT_OUT" | grep -iE "$RETRY_RE" | head -1 | scrub | cut -c1-160)"
+    printf '  ↻ 운영망 연결 재시도 %d/%d (%d초 후)%s\n' "$i" "$max" "$delay" "${why:+ — $why}" >&2
+    sleep "$delay"; delay=$((delay*2))
+    if [ -n "$pc" ] && landed="$(RT_IN_PRECHECK=1; RT_PRECHECK=""; "$pc" 2>/dev/null)"; then
+      printf '  ✓ 끊기기 전에 운영망에 이미 반영됨 — 다시 보내지 않는다\n' >&2
+      RT_OUT="$landed"; RT_ERR=""; RT_DONE=1; rc=0; break
+    fi
+  done
+  rm -f "$errf"
+  RT_TRIES=$i
+  return $rc
+}
 
 ensure_repo() {
   mkdir -p "$WORK_DIR"
@@ -198,7 +247,11 @@ fetch_source() {
 fetch_target() {
   [ -n "$TARGET_URL" ] || die $EX_USAGE "TARGET_URL 이 없다"
   hr "운영망 상태 확인 — $(clean_url "$TARGET_URL")"
-  G fetch -q --prune --no-tags "$TARGET_URL" '+refs/heads/*:refs/airgap/target/*' || die $EX_FAIL "운영망 fetch 실패 (주소·토큰(read_repository)·망 연결 확인)"
+  if ! retry_target G fetch -q --prune --no-tags "$TARGET_URL" '+refs/heads/*:refs/airgap/target/*'; then
+    [ -z "$RT_ERR" ] || printf '%s\n' "$RT_ERR" | scrub | sed 's/^/    /' >&2
+    die $EX_FAIL "운영망 fetch 실패$([ "$RT_TRIES" -gt 0 ] && printf ' (재시도 %s회 뒤)' "$RT_TRIES") (주소·토큰(read_repository)·망 연결 확인)"
+  fi
+  [ "$RT_TRIES" -eq 0 ] || info "운영망 연결 — 재시도 ${RT_TRIES}회 만에 성공"
   ok "운영망 브랜치 $(G for-each-ref --format=x refs/airgap/target | wc -l | tr -d ' ')개"
 }
 
@@ -245,8 +298,22 @@ guard_nonff() { # fast-forward 가 아닌 브랜치가 있고 --force 가 없으
   die $EX_NONFF "fast-forward 가 아닌 브랜치가 있어 아무것도 넣지 않고 멈춘다: ${nonff[*]} — 운영망에서 직접 커밋된 것이 없는지 확인하고, 덮어써도 되면 --force"
 }
 
+# 운영망 브랜치가 PLAN 의 목표 SHA 와 모두 같으면 0 — push 응답만 끊기고 실제로는 들어간 경우를 알아낸다
+push_landed() {
+  local l b old new st refs=() remote
+  for l in ${PLAN[@]+"${PLAN[@]}"}; do read -r b old new st <<<"$l"; [ "$st" = same ] || refs+=("refs/heads/$b"); done
+  [ ${#refs[@]} -gt 0 ] || return 1
+  retry_target G ls-remote "$TARGET_URL" "${refs[@]}" || return 1
+  remote="$RT_OUT"
+  for l in "${PLAN[@]}"; do
+    read -r b old new st <<<"$l"; [ "$st" = same ] && continue
+    printf '%s\n' "$remote" | grep -qxF "$new"$'\t'"refs/heads/$b" || return 1
+  done
+  return 0
+}
+
 push_plan() { # $1 = mode 이름
-  local mode="$1" l b old new st refspecs=() leases=() opt args=() out rc
+  local mode="$1" l b old new st refspecs=() leases=() opt args=() out rc tries landed="" note=""
   guard_nonff "$mode"
   for l in ${PLAN[@]+"${PLAN[@]}"}; do
     read -r b old new st <<<"$l"
@@ -268,30 +335,53 @@ push_plan() { # $1 = mode 이름
   hr "운영망 push — ${#refspecs[@]}개 브랜치"
   [ "$PUSH_ATOMIC" = 1 ] && args+=(--atomic)
   for opt in $PUSH_OPTIONS; do args+=(-o "$opt"); done
-  set +e
-  out="$(G push --porcelain ${args[@]+"${args[@]}"} ${leases[@]+"${leases[@]}"} "$TARGET_URL" "${refspecs[@]}" 2>&1)"; rc=$?
-  set -e
-  printf '%s\n' "$out" | grep -vE '^(To |Done$|remote: *$|remote: +(To create a merge request|http))' | sed 's/^/    /' || true
+  # 재시도해도 안전하다: fast-forward·새 브랜치는 같은 SHA 를 다시 보내면 "이미 최신", --force 브랜치는 이전 SHA 기준 lease 라
+  # 첫 시도가 들어갔으면 lease 불일치로 거부된다 → 어느 쪽이든 운영망 ref 가 목표 SHA 와 같은지 다시 보고 "이미 반영됨" 으로 처리
+  rc=0
+  RT_PRECHECK=push_landed
+  retry_target G push --porcelain ${args[@]+"${args[@]}"} ${leases[@]+"${leases[@]}"} "$TARGET_URL" "${refspecs[@]}" || rc=$?
+  RT_PRECHECK=""
+  out="$RT_ERR"$'\n'"$RT_OUT"; tries=$RT_TRIES
+  if [ -n "$RT_DONE" ]; then landed=1
+  elif [ $rc -ne 0 ] && [ "$tries" -gt 0 ] && push_landed; then
+    landed=1; rc=0; info "재시도가 거부됐지만(lease 불일치·이미 최신) 운영망 ref 가 목표 SHA 와 같다 — 첫 시도가 들어간 것"
+  fi
+  [ -n "$landed" ] || printf '%s\n' "$out" | grep -vE '^(To |Done$|remote: *$|remote: +(To create a merge request|http))' | grep . | scrub | sed 's/^/    /' || true
+  [ "$tries" -gt 0 ] && note="재시도 ${tries}회"
+  [ -n "$landed" ] && note="${note:+$note · }응답 끊김 뒤 반영 확인"
   for l in "${PLAN[@]}"; do
     read -r b old new st <<<"$l"; [ "$st" = same ] && continue
     if [ $rc -eq 0 ]; then
       G update-ref "refs/airgap/target/$b" "$new"
-      case "$st" in new) log_row "$mode" "$b" "$old" "$new" created;; nonff) log_row "$mode" "$b" "$old" "$new" forced "--force";; *) log_row "$mode" "$b" "$old" "$new" pushed;; esac
+      case "$st" in new) log_row "$mode" "$b" "$old" "$new" created "$note";; nonff) log_row "$mode" "$b" "$old" "$new" forced "--force${note:+ · $note}";; *) log_row "$mode" "$b" "$old" "$new" pushed "$note";; esac
     else
-      log_row "$mode" "$b" "$old" "$new" failed "$(printf '%s' "$out" | grep -E '^!|error|rejected' | head -1 | tr '\t' ' ')"
+      log_row "$mode" "$b" "$old" "$new" failed "${note:+$note · }$(printf '%s' "$out" | grep -E '^!|error|rejected|fatal' | head -1 | scrub | tr '\t' ' ')"
     fi
   done
-  [ $rc -eq 0 ] || die $EX_FAIL "push 실패 (위 출력 확인 — 그 사이 운영망이 바뀌었거나 토큰에 write_repository 가 없거나 보호 브랜치 설정)"
-  ok "push 완료 — 기록: $LOG_FILE"
+  [ $rc -eq 0 ] || die $EX_FAIL "push 실패$([ "$tries" -gt 0 ] && printf ' (재시도 %s회 뒤)' "$tries") (위 출력 확인 — 그 사이 운영망이 바뀌었거나 토큰에 write_repository 가 없거나 보호 브랜치 설정)"
+  ok "push 완료${note:+ ($note)} — 기록: $LOG_FILE"
 }
 
 # ---------- 패키지 ----------
-api_curl() { # 토큰은 stdin 설정(-K -)으로만 넘긴다
-  local tok resolve=()
+api_curl_once() { # $1 = 토큰 (셸 함수 인자 — 프로세스 명령줄에는 나오지 않는다)
+  local tok="$1"; shift
+  printf 'header = "PRIVATE-TOKEN: %s"\n' "$tok" | curl -sS "$@" -K -
+}
+api_curl() { # 토큰은 stdin 설정(-K -)으로만 넘긴다. 연결 실패류는 retry_target 이 다시 한다
+  local tok resolve=() rc=0
   tok="$(read_token TARGET)"
   [ -n "$tok" ] || die $EX_USAGE "패키지 저장소 접근에 TARGET 토큰(api 권한)이 필요하다 — TARGET_TOKEN_FILE 또는 AIRGAP_TARGET_TOKEN"
   local r; r="$(cfg TARGET_RESOLVE)"; [ -n "$r" ] && resolve=(--resolve "$r")
-  printf 'header = "PRIVATE-TOKEN: %s"\n' "$tok" | curl -sS --retry 2 ${resolve[@]+"${resolve[@]}"} -K - "$@"
+  retry_target api_curl_once "$tok" ${resolve[@]+"${resolve[@]}"} "$@" || rc=$?
+  [ -z "$RT_ERR" ] || printf '%s\n' "$RT_ERR" | scrub >&2
+  printf '%s' "$RT_OUT"
+  return $rc
+}
+# 올리기 응답이 끊긴 뒤 다시 올리기 전에: 운영망에 이미 같은 sha256 의 파일이 있으면 그 응답 모양을 내고 0 (run_packages 의 pkg·ver·file·sum)
+upload_landed() {
+  local r; r="$(remote_sha "$pkg" "$ver" "$file")" || return 1
+  [ "$r" = "$sum" ] || return 1
+  printf '{"file_sha256":"%s"}' "$sum"
 }
 enc_project() { printf '%s' "$TARGET_PROJECT" | sed 's#/#%2F#g'; }
 
@@ -377,7 +467,7 @@ run_packages() {
     lsum="$(sha256_of "$path")"
     if [ "$lsum" != "$sum" ]; then warn "로컬 파일 sha256 불일치: $path ${lsum:0:12}… ≠ lock ${sum:0:12}…"; log_row "$mode" "pkg:$pkg/$ver/$file" - "$sum" pkg-bad-local "$lsum"; fail=1; continue; fi
     if [ -n "$DRY_RUN" ]; then ok "올릴 예정 — $path ($(du -h "$path" | cut -f1), sha256 일치)"; log_row "$mode" "pkg:$pkg/$ver/$file" - "$sum" dry-run; continue; fi
-    resp="$(api_curl -f --upload-file "$(npath "$path")" "$TARGET_API_URL/projects/$(enc_project)/packages/generic/$pkg/$ver/$file?select=package_file")" \
+    resp="$(RT_PRECHECK=upload_landed; api_curl -f --upload-file "$(npath "$path")" "$TARGET_API_URL/projects/$(enc_project)/packages/generic/$pkg/$ver/$file?select=package_file")" \
       || { warn "올리기 실패"; log_row "$mode" "pkg:$pkg/$ver/$file" - "$sum" pkg-failed; fail=1; continue; }
     got="$(printf '%s' "$resp" | sed -nE 's/.*"file_sha256":"([0-9a-f]{64})".*/\1/p')"
     if [ -n "$got" ] && [ "$got" != "$sum" ]; then warn "올린 뒤 서버 sha256 ${got:0:12}… 이 다르다"; log_row "$mode" "pkg:$pkg/$ver/$file" - "$sum" pkg-bad-remote "$got"; fail=1; continue; fi
@@ -501,6 +591,7 @@ cmd_status() {
   hr "설정 — $CONFIG"
   printf '  이름      %s\n  개발망    %s\n  운영망    %s\n  패턴      %s\n  작업 폴더 %s\n  기록      %s\n  패키지    %s (%s) · lock: %s\n' \
     "$NAME" "$(clean_url "${SOURCE_URL:-—}")" "$(clean_url "${TARGET_URL:-—}")" "$BRANCHES" "$WORK_DIR" "$LOG_FILE" "${TARGET_PROJECT:-—}" "${TARGET_API_URL:-—}" "${PACKAGE_LOCKS:-—}"
+  info "운영망 연결 재시도 ${TARGET_RETRIES}회 · 첫 대기 ${TARGET_RETRY_DELAY}초 (매번 두 배)"
   local t; for t in SOURCE TARGET; do if [ -n "$(read_token $t)" ]; then info "$t 토큰 있음"; else info "$t 토큰 없음 (git credential·SSH 로 인증)"; fi; done
   if [ -d "$REPO" ]; then
     hr "작업 저장소가 마지막으로 본 운영망 브랜치"
