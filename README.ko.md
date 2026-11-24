@@ -100,6 +100,7 @@ flowchart LR
    ```
 
 3. 운영망 호스트 이름이 DNS로 풀리지 않으면 `TARGET_RESOLVE=<호스트>:<포트>:<IP>`를 넣습니다. git(`http.curloptResolve`)과 curl(`--resolve`)에만 적용되고, 시스템 hosts 파일이나 네트워크 설정은 건드리지 않습니다.
+   운영망 연결이 간헐적으로 끊기면(TCP 연결이 15~20초 걸리다 `curl 28` 로 실패) 자동 재시도 설정(`TARGET_RETRIES`·`TARGET_RETRY_DELAY`)을 봅니다. 자세한 내용은 [운영망 연결 재시도](#운영망-연결-재시도)에 있습니다.
 4. 확인합니다.
 
    ```bash
@@ -221,10 +222,31 @@ airgap-sync.sh <mirror|ci|bundle-create|bundle-push <bundle>|packages|status|hel
 |---|---|
 | 0 | 성공(넣을 것이 없을 때 포함) |
 | 1 | 사용법·설정 오류 |
-| 2 | 네트워크·push 실패 |
+| 2 | 네트워크·push 실패 (연결 실패는 `TARGET_RETRIES`번 재시도한 뒤) |
 | 3 | fast-forward가 아닌 브랜치가 있어 멈춤(dry-run도 3) |
 | 4 | bundle 거부(sha256·verify·manifest) |
 | 5 | 패키지 불일치·누락 |
+
+### 운영망 연결 재시도
+
+중간 PC에 따라 운영망 TCP 연결이 가끔 15~20초씩 멈추다 `error: RPC failed; curl 28 Failed to connect … after 21053 ms`로 실패합니다. 그래서 운영망에 닿는 호출(상태 확인 fetch·`ls-remote`, push, 패키지 API 조회·업로드)은 자동으로 다시 시도합니다.
+
+| 설정 | 기본 | 뜻 |
+|---|---|---|
+| `TARGET_RETRIES` | `3` | 첫 시도 뒤 재시도 횟수. `0`이면 재시도하지 않습니다 |
+| `TARGET_RETRY_DELAY` | `5` | 첫 재시도 전 대기(초). 매번 두 배로 늘어납니다(5 → 10 → 20) |
+
+한 번만 바꾸려면 환경 변수 `AIRGAP_TARGET_RETRIES`·`AIRGAP_TARGET_RETRY_DELAY`를 씁니다. 재시도할 때마다 `  ↻ 운영망 연결 재시도 2/3 (10초 후) — <사유>` 한 줄을 출력합니다.
+
+- **연결 실패만 재시도합니다.** curl 6/7/28/52/55/56, `Could not connect`, `Failed to connect`, `RPC failed`, `unexpected disconnect`, `remote end hung up`, HTTP 502/503/504가 여기에 해당합니다.
+- **서버가 답한 거부는 재시도하지 않습니다.** 인증 실패(401/403), 보호 브랜치·hook 거부, non-fast-forward, lease 불일치는 지금처럼 바로 종료하고, 종료 코드도 같습니다(fast-forward 아님은 3).
+- **push 재시도는 안전합니다.**
+  - fast-forward·새 브랜치는 강제 없이 보냅니다.
+  - `--force` 브랜치는 이전 SHA 기준 `--force-with-lease`를 그대로 씁니다.
+  - 다시 보내기 전에 `ls-remote`로 첫 시도가 사실은 들어갔는지(응답만 끊겼는지) 봅니다. 다시 보낸 push가 lease 불일치·이미 최신으로 나와도 한 번 더 봅니다. 운영망 브랜치가 모두 목표 SHA와 같으면 성공(“이미 반영됨”)으로 처리합니다.
+- 패키지 업로드도 같습니다. 다시 올리기 전에 운영망에 같은 sha256의 파일이 있으면 다시 올리지 않습니다.
+- `sync-log.tsv`에는 브랜치마다 최종 결과 한 줄만 남습니다. `note`에 `재시도 N회`가 붙고, 첫 시도가 들어갔던 경우에는 `응답 끊김 뒤 반영 확인`도 붙습니다.
+- git에는 연결 시간 제한 설정(`http.connectTimeout`)이 없어서 연결 대기 시간 자체는 줄이지 않습니다. 재시도로 해결합니다.
 
 ## 6. 기록
 
@@ -242,7 +264,22 @@ time  mode  name  target  branch  old_sha  new_sha  result  note
 - bundle 거부: `rejected-sha256`, `rejected-verify`, `rejected-manifest`
 - 패키지: `pkg-uploaded`, `pkg-skip`, `pkg-missing`, `pkg-bad-local`, `pkg-conflict`, `pkg-failed`
 
-## 7. 시험 (로컬 GitLab)
+## 7. 시험
+
+### 재시도 시험 (GitLab 없이)
+
+`test/retry.sh`는 로컬 bare 저장소 두 개와, 정해 둔 대로 실패하는 가짜 `git`·`curl`, 닫힌 포트(`127.0.0.1:9`)로 재시도 규칙을 확인합니다. CI에서도 push마다 돌립니다.
+
+```bash
+bash test/retry.sh
+```
+
+- 연결 실패는 정해진 횟수만큼, 대기 시간을 두 배씩 늘리며 재시도합니다. `AIRGAP_TARGET_RETRIES=0`이면 재시도하지 않습니다.
+- 인증 실패, 보호 브랜치 거부, non-fast-forward(종료 3)는 재시도하지 않습니다.
+- push·업로드가 들어간 뒤 응답만 끊긴 경우를 “이미 반영됨”으로 처리하고, 다시 올리지 않습니다. 다시 보낸 push가 lease 불일치로 거부된 경우도 같습니다.
+- 기록에는 최종 결과만 남고, 출력에 토큰이 없습니다.
+
+### e2e 시험 (로컬 GitLab)
 
 로컬 GitLab 한 대에 프로젝트 두 개(개발망·운영망 역할)를 만들어 끝까지 돌리고, 끝나면 만든 것을 지웁니다.
 
@@ -284,6 +321,7 @@ E2E_VIA_PS=1 bash test/e2e-local-gitlab.sh    # 도구를 PowerShell 래퍼로 (
 | `could not read Username` / `Unencrypted HTTP is not recommended` (Git Credential Manager) | 토큰 파일이 없거나 비어 있어 GCM이 끼어든 경우입니다. `status`로 토큰이 있는지 확인합니다. HTTP 주소를 GCM으로 쓰려면 `git config --global credential.<주소>.allowUnsafeRemotes true` |
 | `fatal: Authentication failed` / 401 | 토큰 만료·폐기, 또는 권한 부족(개발망 `read_repository`, 운영망 `write_repository`·`api`)입니다 |
 | 운영망 fetch 실패 · `Could not resolve host` | 운영망에 연결되지 않았거나 DNS 문제입니다. `TARGET_RESOLVE=<호스트>:<포트>:<IP>` |
+| `↻ 운영망 연결 재시도` 뒤 `운영망 fetch 실패 (재시도 N회 뒤)` · `push 실패 (재시도 N회 뒤)` | 재시도해도 연결되지 않았습니다. 망 연결을 확인하고, 연결이 불안정하면 `TARGET_RETRIES`·`TARGET_RETRY_DELAY`를 늘립니다 |
 | 종료 3 `fast-forward 아님` | 운영망에서만 생긴 커밋이 있습니다. 화면에 개수가 나옵니다. 운영망에서 `git log <새 SHA>..<운영망 SHA>`로 내용을 보고, 개발망에 반영한 뒤 다시 돌립니다. 버려도 되면 `--force` |
 | `--force` 인데 `pre-receive hook declined` / `protected branch` | 보호 브랜치는 force push가 막혀 있습니다. 운영망 Settings → Repository → Protected branches |
 | push `the receiving end does not support --atomic` | 아주 오래된 서버입니다. `PUSH_ATOMIC=0` |

@@ -69,6 +69,23 @@ Settings are `KEY=VALUE` lines; see [`airgap-sync.example.conf`](airgap-sync.exa
 
 If the target hostname doesn't resolve on the bridge machine, set `TARGET_RESOLVE=<host>:<port>:<ip>`. It applies only to git (`http.curloptResolve`) and curl (`--resolve`); the system hosts file and network settings stay untouched.
 
+### Retrying the target connection
+
+Some bridge machines connect to the target GitLab only intermittently: the TCP connect sometimes stalls for 15–20 seconds and git fails with `RPC failed; curl 28 Failed to connect … after 21053 ms`. Every call that reaches the target (the state fetch, `ls-remote`, the push, and the package API calls) is therefore retried:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `TARGET_RETRIES` | `3` | retries after the first attempt (`0` turns retrying off) |
+| `TARGET_RETRY_DELAY` | `5` | seconds before the first retry; doubles each time (5 → 10 → 20) |
+
+Override them per run with `AIRGAP_TARGET_RETRIES` / `AIRGAP_TARGET_RETRY_DELAY`. Each retry prints one line, such as `↻ 운영망 연결 재시도 2/3 (10초 후) — <reason>`.
+
+- **Only connection failures are retried**: curl 6/7/28/52/55/56, `Could not connect`, `Failed to connect`, `RPC failed`, `unexpected disconnect`, `remote end hung up`, HTTP 502/503/504.
+- **Answers from the server are not retried** and fail at once with the same exit code as before: authentication (401/403), a protected-branch or hook rejection, non-fast-forward, and a lease mismatch.
+- **Push retries are safe.** Fast-forward and new branches are pushed without force, and `--force` branches keep `--force-with-lease` against the previously seen SHA. Before resending, the tool checks with `ls-remote` whether the first attempt actually landed (only the reply was lost). It checks again if the resend is rejected for a lease mismatch. If every target branch already points to the intended SHA, the push counts as done.
+- The same check applies to package uploads: if the registry already has the file with the expected sha256, it isn't uploaded again.
+- `sync-log.tsv` keeps one row per branch with the final result; the `note` column says `재시도 N회` (and `응답 끊김 뒤 반영 확인` when the first attempt had landed).
+
 ## Packages (lock files)
 
 Each lock file describes one package. The package name is the lock file's name without `.lock`, and each file is uploaded to `generic/<package>/<version>/<file>`. Two formats are accepted:
@@ -107,7 +124,7 @@ A push pipeline syncs only its own branch; web and scheduled pipelines sync ever
 |---|---|
 | 0 | success, including "nothing to push" |
 | 1 | usage or config error |
-| 2 | network or push failure |
+| 2 | network or push failure (after `TARGET_RETRIES` retries for connection failures) |
 | 3 | a branch is not a fast-forward, so nothing was pushed (`--dry-run` also returns 3) |
 | 4 | bundle rejected: sha256, verify, or manifest mismatch |
 | 5 | package mismatch or missing file |
@@ -126,6 +143,12 @@ Possible `result` values:
 `--report FILE` (or running as a CI job) also writes only the current run's rows to a separate file, `airgap-sync-report.tsv` in CI.
 
 ## Testing
+
+`test/retry.sh` needs no GitLab. It uses two local bare repositories, a fake `git` and `curl` that fail on cue, and a closed port to check the retry rules: connection failures are retried with backoff, while authentication failures, rejections and non-fast-forward are not. It also checks that a push or upload that landed before the connection dropped is recognised as done, and that no token is printed. CI runs it on every push.
+
+```bash
+bash test/retry.sh
+```
 
 `test/e2e-local-gitlab.sh` treats two projects on one local GitLab as "dev" and "prod" and runs both modes end to end. Its tokens use exactly the scopes listed above. When it finishes, it deletes everything it created.
 
